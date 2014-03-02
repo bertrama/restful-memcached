@@ -1,18 +1,16 @@
 require 'rubygems'
 require 'sinatra/base'
-require 'memcached'
 require 'yaml'
+require 'torquebox/cache'
+
+def reload_fn cache, key, value
+  # (val.to_i + value).to_s
+  val = cache.get(key)
+  cache.put(key, val.to_i + value)
+  cache.get(key).to_s
+end
 
 module RESTmc
-
-  def self.config
-    begin
-      @config ||= YAML.load_file(File.join(File.dirname(__FILE__), '..', 'config.yml'))[RESTmc::Application.environment.to_s]
-    rescue
-      @config = { 'servers' => ['127.0.0.1:11211'] }
-    end
-  end
-
   class Application < Sinatra::Base
     mime_type :text, 'text/plain'
     set :reload_templates, false  # we have no templates
@@ -21,57 +19,85 @@ module RESTmc
     DEFAULT_TTL = 0  # never expire; use @mc.options[:default_ttl] for the client default of 1 week
 
     def initialize
-      @mc = Memcached.new RESTmc.config['servers']
+      @cache = TorqueBox::Infinispan::Cache.new
     end
 
     before do
       content_type :text
     end
 
+    put '/' do
+      load 'lib/restmc.rb'
+      "reload"
+    end
+
+    get '/' do
+      @cache.keys.join("\n")
+    end
+
     get '/*' do
       begin
-        @mc.get splat_to_key(params[:splat]), should_marshal?
-      rescue Memcached::NotFound
+        @cache.get(splat_to_key(params[:splat])).to_s
+      rescue Exception => e
         status 404
+        ''
       end
     end
 
     put '/+/*' do
       begin
+        key =  splat_to_key(params[:splat])
         data = request.body.read.to_i
-        by = (data > 0 ? data : 1)
-        @mc.incr splat_to_key(params[:splat]), by
-      rescue Memcached::NotFound
-        @mc.set splat_to_key(params[:splat]), by, get_ttl, false
+        data = 1 if data < 1
+        @cache.increment(key, data).to_s
+      rescue TypeError
+        @cache.put(key, @cache.get(key).to_i + data).to_s
+      rescue Exception => e
+        @cache.put(key, data, get_ttl).to_s
       end
     end
 
     put '/-/*' do
       begin
+        key = splat_to_key(params[:splat])
         data = request.body.read.to_i
-        by = (data > 0 ? data : 1)
-        @mc.decr splat_to_key(params[:splat]), by
-      rescue Memcached::NotFound
-        @mc.set splat_to_key(params[:splat]), 0, get_ttl, false
+        data = 1 if data < 1
+        @cache.decrement(key, data).to_s
+      rescue TypeError
+        @cache.put(key, @cache.get(key).to_i + data).to_s
+      rescue Exception => e
+        @cache.put(key, 1 - data, get_ttl).to_s
       end
     end
 
     put '/*' do
-      @mc.set splat_to_key(params[:splat]), request.body.read, get_ttl, should_marshal?
+      @cache.put(splat_to_key(params[:splat]), request.body.read, get_ttl).to_s
     end
 
     post '/*' do
       begin
-        @mc.add splat_to_key(params[:splat]), request.body.read, get_ttl, should_marshal?
-      rescue Memcached::NotStored
+        data = request.body.read
+        data = data.to_i if data.match(/^\d+$/)
+        @cache.put_if_absent(splat_to_key(params[:splat]), data, get_ttl).to_s
+      rescue Exception => e
         status 409
+        ''
+      end
+    end
+
+    delete '/' do
+      begin
+        @cache.clear
+        'Cache Cleared'
+      rescue Exception => e
+        status 400
       end
     end
 
     delete '/*' do
       begin
-        @mc.delete splat_to_key(params[:splat])
-      rescue Memcached::NotFound
+        @cache.remove(splat_to_key(params[:splat])).to_s
+      rescue Exception => e
         status 404
       end
     end
@@ -92,10 +118,5 @@ module RESTmc
       end
       ttl
     end
-
-    def should_marshal?
-      ENABLE_MARSHAL
-    end
-
   end
 end
