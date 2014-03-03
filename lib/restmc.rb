@@ -3,12 +3,15 @@ require 'sinatra/base'
 require 'yaml'
 require 'torquebox/cache'
 
-def reload_fn cache, key, value
-  # (val.to_i + value).to_s
-  val = cache.get(key)
-  cache.put(key, val.to_i + value)
-  cache.get(key).to_s
-end
+##
+# The general pattern is:
+# base_url/ for all caches
+# base_url/:cache for one cache
+# base_url/:cache/:key for one value
+# GET to read data, PUT to write data
+# POST will only set a key if empty
+#
+# For all actions, if the cache doesn't exist create it.
 
 module RESTmc
   class Application < Sinatra::Base
@@ -19,84 +22,114 @@ module RESTmc
     DEFAULT_TTL = 0  # never expire; use @mc.options[:default_ttl] for the client default of 1 week
 
     def initialize
-      @cache = TorqueBox::Infinispan::Cache.new
+      @caches = {}
+      @defaults = { :name => nil }
     end
 
+    # Our return values should all be content-type: text/plain
     before do
       content_type :text
     end
 
-    put '/' do
-      load 'lib/restmc.rb'
-      "reload"
-    end
-
+    # GET / should list the cache bins.
     get '/' do
-      @cache.keys.join("\n")
+      @caches.keys.join("\n")
     end
 
-    get '/*' do
+    # GET /:cache/ should list the keys for the bin.
+    get '/:cache/' do
+      cache = params[:cache]
+      @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
+      @caches[cache].keys.join("\n");
+    end
+
+    # GET /:cache/* should fetch the value for the key *.
+    get '/:cache/*' do
+      cache = params[:cache]
+      key   = splat_to_key(params[:splat])
+      @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
       begin
-        @cache.get(splat_to_key(params[:splat])).to_s
+        @caches[cache].get(key).to_s
       rescue Exception => e
         status 404
-        ''
+        '404 File not found'
       end
     end
 
-    put '/+/*' do
+    # PUT /:cache/+/* should increment the value for the key *.
+    put '/:cache/+/*' do
       begin
-        key =  splat_to_key(params[:splat])
-        data = request.body.read.to_i
-        data = 1 if data < 1
-        @cache.increment(key, data).to_s
+        cache = params[:cache]
+        key   =  splat_to_key(params[:splat])
+        @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
+        data  = request.body.read.to_i
+        data  = 1 if data < 1
+        @caches[cache].increment(key, data).to_s
       rescue TypeError
-        @cache.put(key, @cache.get(key).to_i + data).to_s
+        @caches[cache].put(key, @caches[cache].get(key).to_i + data).to_s
       rescue Exception => e
-        @cache.put(key, data, get_ttl).to_s
+        @caches[cache].put(key, data, get_ttl).to_s
       end
     end
 
-    put '/-/*' do
+    # PUT /:cache/-/* should increment the value for the key *.
+    put '/:cache/-/*' do
       begin
-        key = splat_to_key(params[:splat])
-        data = request.body.read.to_i
-        data = 1 if data < 1
-        @cache.decrement(key, data).to_s
+        cache = params[:cache]
+        key   = splat_to_key(params[:splat])
+        @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
+        data  = request.body.read.to_i
+        data  = 1 if data < 1
+        @caches[cache].decrement(key, data).to_s
       rescue TypeError
-        @cache.put(key, @cache.get(key).to_i + data).to_s
+        @caches[cache].put(key, @caches[cache].get(key).to_i + data).to_s
       rescue Exception => e
-        @cache.put(key, 1 - data, get_ttl).to_s
+        @caches[cache].put(key, 1 - data, get_ttl).to_s
       end
     end
 
-    put '/*' do
-      @cache.put(splat_to_key(params[:splat]), request.body.read, get_ttl).to_s
+    # PUT /:cache/* should put the value for the key *.
+    put '/:cache/*' do
+      cache = params[:cache]
+      key   = splat_to_key(params[:splat])
+      @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
+      @caches[cache].put(key, request.body.read, get_ttl).to_s
     end
 
-    post '/*' do
+    # POST /:cache/* should put_if_absent the value for the key *.
+    post '/:cache/*' do
       begin
+        cache = params[:cache]
+        key   = splat_to_key(params[:splat])
+        @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
         data = request.body.read
         data = data.to_i if data.match(/^\d+$/)
-        @cache.put_if_absent(splat_to_key(params[:splat]), data, get_ttl).to_s
+        @caches[cache].put_if_absent(key, data, get_ttl).to_s
       rescue Exception => e
         status 409
-        ''
+        '409 status'
       end
     end
 
-    delete '/' do
+    # DELETE /:cache/ should clear the cache.
+    delete '/:cache/' do
       begin
-        @cache.clear
+        cache = params[:cache]
+        @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
+        @caches[cache].clear
         'Cache Cleared'
       rescue Exception => e
         status 400
       end
     end
 
-    delete '/*' do
+    # DELETE /:cache/ should remove the key *. 
+    delete '/:cache/*' do
       begin
-        @cache.remove(splat_to_key(params[:splat])).to_s
+        cache = params[:cache]
+        key   = splat_to_key(params[:splat])
+        @caches[cache] ||= TorqueBox::Infinispan::Cache.new(@defaults.merge({:name => cache}))
+        @caches[cache].remove(key).to_s
       rescue Exception => e
         status 404
       end
